@@ -283,7 +283,11 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		pool:        p,
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
-	cleanup := func() {}
+	cleanup := func() {
+		// Wait for async account-stats writes before the temp config dir is
+		// removed; otherwise t.TempDir cleanup may race with config.UpdateAccountStats.
+		p.WaitForPendingStats()
+	}
 	return h, cleanup
 }
 

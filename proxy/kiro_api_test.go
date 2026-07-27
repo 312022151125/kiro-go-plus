@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
@@ -15,11 +16,20 @@ import (
 func TestResolveProfileArnReturnsCachedValueWithoutRequest(t *testing.T) {
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			t.Fatal("unexpected HTTP request for cached profile ARN")
-			return nil, nil
+			// Use an error instead of t.Fatal: background goroutines from earlier
+			// tests may still hit this client after the test goroutine completes.
+			return nil, fmt.Errorf("unexpected HTTP request for cached profile ARN")
 		}),
 	})
-	t.Cleanup(func() { InitKiroHttpClient("") })
+	// Leave an inert client behind: background refresh goroutines may outlive the
+	// test and must not be handed a real transport/network client.
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("network disabled after test")
+			}),
+		})
+	})
 
 	account := &config.Account{ProfileArn: " arn:aws:codewhisperer:profile/test "}
 	got, err := ResolveProfileArn(account)
@@ -85,29 +95,42 @@ func TestResolveProfileArnFetchesAndCachesProfile(t *testing.T) {
 		t.Fatalf("add account: %v", err)
 	}
 
+	var validPostSeen atomic.Bool
 	kiroRestHttpStore.Store(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			if req.Method != http.MethodPost {
-				t.Fatalf("expected POST, got %s", req.Method)
+			// Background goroutines from earlier tests may still hit this stub;
+			// do not t.Fatalf here (they run outside the test goroutine). Record a
+			// valid POST to /ListAvailableProfiles and error out everything else.
+			if req.Method == http.MethodPost && req.URL.Path == "/ListAvailableProfiles" {
+				if got := req.Header.Get("Content-Type"); got != "application/json" {
+					return nil, fmt.Errorf("expected JSON content type, got %q", got)
+				}
+				validPostSeen.Store(true)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"profiles":[{"arn":" arn:aws:codewhisperer:us-east-1:123456789012:profile/fetched "}]} `)),
+					Header:     make(http.Header),
+				}, nil
 			}
-			if req.URL.Path != "/ListAvailableProfiles" {
-				t.Fatalf("expected ListAvailableProfiles path, got %s", req.URL.Path)
-			}
-			if got := req.Header.Get("Content-Type"); got != "application/json" {
-				t.Fatalf("expected JSON content type, got %q", got)
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"profiles":[{"arn":" arn:aws:codewhisperer:us-east-1:123456789012:profile/fetched "}]} `)),
-				Header:     make(http.Header),
-			}, nil
+			return nil, fmt.Errorf("unexpected request in stub: %s %s", req.Method, req.URL.Path)
 		}),
 	})
-	t.Cleanup(func() { InitKiroHttpClient("") })
+	// Leave an inert client behind: background refresh goroutines may outlive the
+	// test and must not be handed a real transport/network client.
+	t.Cleanup(func() {
+		kiroRestHttpStore.Store(&http.Client{
+			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("network disabled after test")
+			}),
+		})
+	})
 
 	requestAccount := account
 	requestAccount.UsageCurrent = 0
 	got, err := ResolveProfileArn(&requestAccount)
+	if !validPostSeen.Load() {
+		t.Fatalf("ResolveProfileArn did not POST /ListAvailableProfiles")
+	}
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

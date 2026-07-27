@@ -21,6 +21,7 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	statsUpdateWg sync.WaitGroup             // tracks async config.UpdateAccountStats goroutines
 }
 
 var (
@@ -97,13 +98,13 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		// 跳过冷却中的账号
+		// Skip accounts that are still on cooldown.
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 			seen[acc.ID] = true
 			continue
 		}
 
-		// 跳过即将过期的 Token
+		// Skip accounts whose token is about to expire.
 		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			seen[acc.ID] = true
 			continue
@@ -118,7 +119,8 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// No immediately available account; fall back to the one whose cooldown
+	// ends soonest (excluding quota-exhausted accounts unless over-usage is allowed).
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -490,8 +492,19 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 		}
 	}
 	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		p.statsUpdateWg.Add(1)
+		go func() {
+			defer p.statsUpdateWg.Done()
+			config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		}()
 	}
+}
+
+// WaitForPendingStats blocks until all async stats-persistence goroutines spawned
+// by this pool have completed. Tests should call this in cleanup before tearing
+// down the config directory to avoid races with config.UpdateAccountStats.
+func (p *AccountPool) WaitForPendingStats() {
+	p.statsUpdateWg.Wait()
 }
 
 // GetAllAccounts 获取所有账号副本
